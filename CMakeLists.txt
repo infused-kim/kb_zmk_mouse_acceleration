@@ -1,0 +1,1 @@
+target_sources_ifdef(CONFIG_ZMK_INPUT_ACCELERATOR app PRIVATE src/input_accelerator.c)

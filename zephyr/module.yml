@@ -1,0 +1,6 @@
+name: kb_zmk_mouse_acceleration
+build:
+  cmake: .
+  kconfig: Kconfig
+  settings:
+    dts_root: .
