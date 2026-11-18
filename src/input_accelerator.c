@@ -25,6 +25,13 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // The default rate to use for interval based speed calc
 #define INPUT_ACCELERATOR_DEFAULT_SENDING_RATE 100
 
+// Below this speed, gain mode uses the gain at speed 0 as the factor, because
+// output / speed can't be calculated at 0
+#define INPUT_ACCELERATOR_GAIN_MODE_MIN_SPEED 0.01f
+
+// From here on softplus(x) equals x, and calculating it would overflow expf
+#define INPUT_ACCELERATOR_SOFTPLUS_LINEAR_FROM 20.0f
+
 struct vector2d {
     int32_t x;
     int32_t y;
@@ -44,6 +51,7 @@ enum input_accelerator_curve {
 struct input_accelerator_config {
     enum input_accelerator_curve acc_curve;
     char *acc_curve_name;
+    bool gain_mode;
     int acc_base;
     int acc_cap;
     int acc_rate;
@@ -101,6 +109,10 @@ struct input_accelerator_data {
     // Calculated once from the config, see
     // `zmk_input_acc_get_sigmoid_start_offset_addition`
     float sigmoid_start_offset_addition;
+
+    // Calculated once from the config for gain mode, see
+    // `zmk_input_acc_get_acceleration_factor_sigmoid_gain`
+    float sigmoid_softplus_at_zero;
 };
 
 static void zmk_input_acc_processor_start_report(const struct input_accelerator_config *config,
@@ -137,6 +149,10 @@ static float zmk_input_acc_get_acceleration_factor_sigmoid(float speed, float ac
                                                            int start_offset,
                                                            float start_offset_addition,
                                                            int speed_cap);
+static float zmk_input_acc_get_acceleration_factor_sigmoid_gain(
+    float speed, float acc_base, float acc_cap, float acc_rate, int start_offset,
+    float start_offset_addition, float softplus_at_zero, int speed_cap);
+static float zmk_input_acc_softplus(float x);
 static float zmk_input_acc_get_acc_factor_with_speed_cap(float acc_factor, float speed,
                                                          int speed_cap);
 static bool zmk_input_acc_is_new_mov(float mov, float prev_mov, int64_t mov_interval);
@@ -262,6 +278,12 @@ static float zmk_input_acc_get_acc_factor(const struct input_accelerator_config 
     // guarantees a valid value.
     switch (config->acc_curve) {
     case INPUT_ACCELERATOR_CURVE_SIGMOID:
+        if (config->gain_mode) {
+            return zmk_input_acc_get_acceleration_factor_sigmoid_gain(
+                speed, data->acc_base, data->acc_cap, data->acc_rate, config->start_offset,
+                data->sigmoid_start_offset_addition, data->sigmoid_softplus_at_zero,
+                config->speed_cap);
+        }
         return zmk_input_acc_get_acceleration_factor_sigmoid(
             speed, data->acc_base, data->acc_cap, data->acc_rate, config->start_offset,
             data->sigmoid_start_offset_addition, config->speed_cap);
@@ -531,6 +553,62 @@ static float zmk_input_acc_get_sigmoid_start_offset_addition(float limit, float 
     return zmk_input_acc_sigmoid_function_inverse(start_offset_y_value, limit, acc_rate);
 }
 
+// Gain mode, like Raw Accel's "Gain" switch: the sigmoid curve defines the
+// gain (how much the output speed changes when the input speed changes)
+// instead of the acceleration factor (the ratio of output to input speed).
+//
+// The output speed is the area under the gain curve from 0 to the speed:
+//
+//   gain(v)   = base + limit * sigmoid(rate * (v + shift))
+//   output(v) = base * v + limit / rate
+//                 * (softplus(rate * (v + shift)) - softplus(rate * shift))
+//   factor(v) = output(v) / v
+//
+// `softplus(x) = ln(1 + e^x)` is the integral of the sigmoid function, and
+// `shift = start_offset_addition - start_offset` positions the curve like in
+// `zmk_input_acc_sigmoid_function_with_offset`. Subtracting the softplus at
+// speed 0 makes the output start at 0. It only depends on the config, so
+// it's calculated once at init.
+//
+// The factor is the average gain from 0 to the speed. It rises more slowly
+// than the gain and only approaches the cap at high speeds.
+static float zmk_input_acc_get_acceleration_factor_sigmoid_gain(
+    float speed, float acc_base, float acc_cap, float acc_rate, int start_offset,
+    float start_offset_addition, float softplus_at_zero, int speed_cap) {
+
+    float speed_abs = fabsf(speed);
+    float sigmoid_limit = acc_cap - acc_base;
+
+    float acc_factor;
+    if (speed_abs < INPUT_ACCELERATOR_GAIN_MODE_MIN_SPEED) {
+        // output(v) / v can't be calculated at speed 0. Near 0 it equals the
+        // gain at speed 0.
+        acc_factor = acc_base + zmk_input_acc_sigmoid_function_with_offset(0, sigmoid_limit,
+                                                                           acc_rate, start_offset,
+                                                                           start_offset_addition);
+    } else {
+        float shift = start_offset_addition - start_offset;
+        float softplus = zmk_input_acc_softplus(acc_rate * (speed_abs + shift));
+        float output_speed =
+            acc_base * speed_abs + sigmoid_limit / acc_rate * (softplus - softplus_at_zero);
+
+        acc_factor = output_speed / speed_abs;
+    }
+
+    acc_factor = zmk_input_acc_get_acc_factor_with_speed_cap(acc_factor, speed, speed_cap);
+
+    return acc_factor;
+}
+
+// ln(1 + e^x). For large x it equals x, which also avoids an overflow of expf.
+static float zmk_input_acc_softplus(float x) {
+    if (x > INPUT_ACCELERATOR_SOFTPLUS_LINEAR_FROM) {
+        return x;
+    }
+
+    return log1pf(expf(x));
+}
+
 static float zmk_input_acc_get_acc_factor_with_speed_cap(float acc_factor, float speed,
                                                          int speed_cap) {
 
@@ -592,6 +670,9 @@ static int zmk_input_accelerator_init(const struct device *dev,
     if (config->acc_curve == INPUT_ACCELERATOR_CURVE_SIGMOID) {
         data->sigmoid_start_offset_addition = zmk_input_acc_get_sigmoid_start_offset_addition(
             data->acc_cap - data->acc_base, data->acc_rate);
+
+        float shift = data->sigmoid_start_offset_addition - config->start_offset;
+        data->sigmoid_softplus_at_zero = zmk_input_acc_softplus(data->acc_rate * shift);
     }
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_ACCELERATOR_LOG_ENABLED)
@@ -610,6 +691,7 @@ static const struct zmk_input_processor_driver_api zmk_input_accelerator_process
     static const struct input_accelerator_config config_##n = {                                    \
         .acc_curve = DT_INST_ENUM_IDX(n, acceleration_curve),                                      \
         .acc_curve_name = DT_INST_PROP(n, acceleration_curve),                                     \
+        .gain_mode = DT_INST_ENUM_HAS_VALUE(n, acceleration_mode, gain),                           \
         .acc_base = DT_INST_PROP(n, acceleration_base),                                            \
         .acc_cap = DT_INST_PROP(n, acceleration_cap),                                              \
         .acc_rate = DT_INST_PROP(n, acceleration_rate),                                            \

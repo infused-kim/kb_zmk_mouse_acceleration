@@ -15,11 +15,35 @@ properties:
   acceleration-curve:
     type: string
     required: false
-    default: none
-    description: Which acceleration curve formula should be used. Available options are "none" and "sigmoid". "none" will only apply the base acceleration factor, but no curve. "sigmoid" will accelerate the input speeds using a sigmoid function that rises from the base to the max acceleration factor.
+    default: sigmoid
+    description: Which acceleration curve formula should be used. Available options are "sigmoid" (the default) and "none". "none" will only apply the base acceleration factor, but no curve. "sigmoid" will accelerate the input speeds using a sigmoid function that rises from the base to the max acceleration factor.
     enum:
       - none
       - sigmoid
+
+  acceleration-mode:
+    type: string
+    required: false
+    default: gain
+    description: |
+      What the curve defines: "gain" (the default) or "factor", like the
+      "Gain" switch in Raw Accel. Only used by the "sigmoid" curve.
+
+      The acceleration factor is the ratio between output and input speed. The
+      gain is how much the output speed changes when the input speed changes,
+      which is what you feel when you speed up or slow down. In "factor" mode,
+      the gain overshoots the cap while the curve is rising, which can feel
+      like a kick. In "gain" mode, the gain follows the curve exactly and never
+      exceeds the cap.
+
+      The factor is then the average gain from 0 to the current speed, so it
+      rises more slowly and only approaches the cap at high speeds. Expect to
+      raise `acceleration-cap` (and maybe lower
+      `acceleration-start-offset`) to get the same top speed as in "factor"
+      mode.
+    enum:
+      - factor
+      - gain
 
   acceleration-base:
     type: int
