@@ -15,8 +15,8 @@ properties:
   acceleration-curve:
     type: string
     required: false
-    default: none
-    description: Which acceleration curve formula should be used. Available options are "none" and "sigmoid". "none" will only apply the base acceleration factor, but no curve. "sigmoid" will accelerate the input speeds using a sigmoid function that rises from the base to the max acceleration factor.
+    default: sigmoid
+    description: Which acceleration curve formula should be used. Available options are "sigmoid" (the default) and "none". "none" will only apply the base acceleration factor, but no curve. "sigmoid" will accelerate the input speeds using a sigmoid function that rises from the base to the max acceleration factor.
     enum:
       - none
       - sigmoid
