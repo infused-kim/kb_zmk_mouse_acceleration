@@ -20,6 +20,7 @@ devicetree properties without the `acceleration-` prefix and use the same
 units, so you can copy values from the config:
 
     ./mouse_acceleration_models.py plot
+    ./mouse_acceleration_models.py plot --mode gain
     ./mouse_acceleration_models.py plot --cap 150
     ./mouse_acceleration_models.py plot -b 80 -c 130 -r 40 -o 12
     ./mouse_acceleration_models.py table --step 5
@@ -66,7 +67,17 @@ from rich.table import Table
 #
 
 
+class AccelerationMode(str, Enum):
+    """
+    Values of the `acceleration-mode` devicetree property.
+    """
+
+    factor = 'factor'
+    gain = 'gain'
+
+
 # Match the TrackPoint's `input_accelerator_move` node in the zmk-config
+DEFAULT_ACCELERATION_MODE = AccelerationMode.factor
 DEFAULT_ACCELERATION_BASE = 80
 DEFAULT_ACCELERATION_CAP = 130
 DEFAULT_ACCELERATION_RATE = 40
@@ -117,6 +128,15 @@ OUTPUT_PANEL = 'Output'
 # Options shared by the commands. Named like the `zmk,input-accelerator`
 # devicetree properties without the `acceleration-` prefix and in the same
 # units.
+ModeOption = Annotated[
+    AccelerationMode,
+    typer.Option(
+        '--mode',
+        '-M',
+        help='Whether the curve defines the acceleration factor or the gain',
+        rich_help_panel=ACCELERATION_PANEL,
+    ),
+]
 BaseOption = Annotated[
     int,
     typer.Option(
@@ -223,6 +243,7 @@ WidthOption = Annotated[
 @app.command()
 def plot(
     *,
+    mode: ModeOption = DEFAULT_ACCELERATION_MODE,
     base: BaseOption = DEFAULT_ACCELERATION_BASE,
     cap: CapOption = DEFAULT_ACCELERATION_CAP,
     rate: RateOption = DEFAULT_ACCELERATION_RATE,
@@ -240,6 +261,7 @@ def plot(
     """
 
     curve = CurveSettings(
+        mode,
         base,
         cap,
         rate,
@@ -255,6 +277,7 @@ def plot(
 @app.command()
 def table(
     *,
+    mode: ModeOption = DEFAULT_ACCELERATION_MODE,
     base: BaseOption = DEFAULT_ACCELERATION_BASE,
     cap: CapOption = DEFAULT_ACCELERATION_CAP,
     rate: RateOption = DEFAULT_ACCELERATION_RATE,
@@ -270,6 +293,7 @@ def table(
     """
 
     curve = CurveSettings(
+        mode,
         base,
         cap,
         rate,
@@ -282,6 +306,7 @@ def table(
 @app.command('all')
 def show_all(
     *,
+    mode: ModeOption = DEFAULT_ACCELERATION_MODE,
     base: BaseOption = DEFAULT_ACCELERATION_BASE,
     cap: CapOption = DEFAULT_ACCELERATION_CAP,
     rate: RateOption = DEFAULT_ACCELERATION_RATE,
@@ -300,6 +325,7 @@ def show_all(
     """
 
     curve = CurveSettings(
+        mode,
         base,
         cap,
         rate,
@@ -405,6 +431,7 @@ class CurveSettings:
     same units: factors in percent and the rate in hundredths.
     """
 
+    acceleration_mode: AccelerationMode
     acceleration_base: int
     acceleration_cap: int
     acceleration_rate: int
@@ -412,7 +439,12 @@ class CurveSettings:
     acceleration_speed_cap: int
 
     def acc_factor(self, speed: float) -> float:
-        return calc_acceleration_factor_sigmoid(
+        if self.acceleration_mode == AccelerationMode.gain:
+            calc_curve = calc_acceleration_factor_sigmoid_gain
+        else:
+            calc_curve = calc_acceleration_factor_sigmoid
+
+        return calc_curve(
             speed,
             self.acceleration_base / 100,
             self.acceleration_cap / 100,
@@ -442,6 +474,7 @@ class CurveSettings:
         """
 
         lines = [
+            f'acceleration-mode = "{self.acceleration_mode.value}";',
             f'acceleration-base = <{self.acceleration_base}>;',
             f'acceleration-cap = <{self.acceleration_cap}>;',
             f'acceleration-rate = <{self.acceleration_rate}>;',
@@ -777,6 +810,13 @@ def show_png_in_terminal(png: bytes, columns: int, rows: int) -> None:
 # Curve model. Keep in sync with src/input_accelerator.c
 #
 
+# Below this speed, gain mode uses the gain at speed 0 as the factor, because
+# output / speed can't be calculated at 0
+GAIN_MODE_MIN_SPEED = 0.01
+
+# From here on softplus(x) equals x, and calculating it would overflow exp
+SOFTPLUS_LINEAR_FROM = 20
+
 
 def calc_acceleration_factor_sigmoid(
     speed: float,
@@ -894,11 +934,74 @@ def get_acc_factor_with_speed_cap(
     return capped_acc_factor
 
 
+def calc_acceleration_factor_sigmoid_gain(
+    speed: float,
+    acc_base: float,
+    acc_cap: float,
+    acc_rate: float,
+    *,
+    speed_cap: float | None = D_SPEED_CAP,
+    start_offset: float = D_OFFSET,
+    should_round: bool = D_SHOULD_ROUND,
+) -> float:
+    """
+    Gain mode (`acceleration-mode = "gain"`): the sigmoid curve defines the
+    gain instead of the acceleration factor. The output speed is the area under
+    the gain curve, and the factor is output speed / speed. See
+    `zmk_input_acc_get_acceleration_factor_sigmoid_gain` in the C code.
+    """
+
+    speed_abs = abs(speed)
+    sigmoid_limit = acc_cap - acc_base
+
+    start_offset_y_value = sigmoid_limit * 0.025
+    start_offset_addition = sigmoid_function_inverse(
+        start_offset_y_value, sigmoid_limit, acc_rate, raise_error=False
+    )
+    shift = start_offset_addition - start_offset
+
+    if speed_abs < GAIN_MODE_MIN_SPEED:
+        # Near speed 0, the factor equals the gain at speed 0
+        acc_factor = acc_base + sigmoid_function(
+            shift, sigmoid_limit, acc_rate
+        )
+    else:
+        output_speed = acc_base * speed_abs + sigmoid_limit / acc_rate * (
+            softplus(acc_rate * (speed_abs + shift))
+            - softplus(acc_rate * shift)
+        )
+        acc_factor = output_speed / speed_abs
+
+    acc_factor = get_acc_factor_with_speed_cap(
+        acc_factor,
+        speed,
+        speed_cap,
+        acc_base,
+    )
+
+    if should_round is True:
+        acc_factor = round(acc_factor, 2)
+
+    return acc_factor
+
+
+def softplus(x: float) -> float:
+    """
+    ln(1 + e^x), the integral of the sigmoid function. For large x it equals
+    x, which also avoids an overflow of exp.
+    """
+
+    if x > SOFTPLUS_LINEAR_FROM:
+        return x
+
+    return math.log1p(math.exp(x))
+
+
 #
 # Functions used by the jupyter notebook
 #
 
-CurveName = Literal['sigmoid_pure', 'sigmoid']
+CurveName = Literal['sigmoid_pure', 'sigmoid', 'sigmoid_gain']
 
 
 def display_curve(
@@ -1009,6 +1112,8 @@ def gen_acceleration_factor_range(
         calc_curve = calc_acceleration_factor_sigmoid_pure
     elif curve == 'sigmoid':
         calc_curve = calc_acceleration_factor_sigmoid
+    elif curve == 'sigmoid_gain':
+        calc_curve = calc_acceleration_factor_sigmoid_gain
     else:
         message = f'Unknown curve: {curve}'
         raise ValueError(message)

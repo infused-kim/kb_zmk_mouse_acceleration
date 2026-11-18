@@ -59,6 +59,12 @@ processor. It was split out of the PS/2 driver
 - An earlier version had a copy of ZMK's listener (`zmk,input-listener-accel`)
   that accelerated the whole report at sync with the current report's factor.
   It was removed after the processor felt just as good.
+- `acceleration-mode = "gain"` (sigmoid only) treats the curve as the gain,
+  like Raw Accel's "Gain" switch. The factor is output / speed, where output
+  is the closed-form integral of the sigmoid (a softplus). `"gain"` is the
+  default, because it feels smoother. The C config keeps it
+  as `bool gain_mode`, set with `DT_INST_ENUM_HAS_VALUE`, so the enum order
+  doesn't matter.
 - Each axis keeps a float remainder. A new movement (change of sign, or a
   pause of more than 200 ms) discards it and makes the first value at least 1.
   `prev_mov` is the last non-zero movement of each axis, so a pausing axis
